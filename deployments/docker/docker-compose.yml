@@ -1,0 +1,98 @@
+version: "3.8"
+
+# Local dev stack. Mongo runs as a single-node replica set because
+# transactions (used later for job + execution_history writes) require
+# a replica set even with one member.
+services:
+  kafka:
+    image: bitnami/kafka:3.7
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: echo "try { rs.status() } catch (e) { rs.initiate() }" | mongosh --quiet
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.api
+    ports:
+      - "8080:8080"
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      HTTP_PORT: "8080"
+    depends_on:
+      - mongo
+
+  scheduler:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.scheduler
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      SCHEDULER_TICK: 500ms
+      KAFKA_BROKERS: kafka:9092
+    depends_on:
+      - mongo
+      - kafka
+
+  executor-log-message:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.executor
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      KAFKA_BROKERS: kafka:9092
+      JOB_TYPE: log-message
+    depends_on:
+      - mongo
+      - kafka
+
+  executor-noop:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.executor
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      KAFKA_BROKERS: kafka:9092
+      JOB_TYPE: noop
+    depends_on:
+      - mongo
+      - kafka
+
+  reaper:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.reaper
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      CLAIM_TIMEOUT: 5m
+      QUEUED_TIMEOUT: 30s
+    depends_on:
+      - mongo
+
+volumes:
+  mongo-data:

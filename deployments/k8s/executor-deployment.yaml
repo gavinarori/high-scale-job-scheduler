@@ -1,0 +1,65 @@
+# One Deployment per job type — set JOB_TYPE per instance so each type's
+# consumer group scales independently on its own topic's lag.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: executor-log-message
+  labels:
+    app: executor
+    jobType: log-message
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: executor
+      jobType: log-message
+  template:
+    metadata:
+      labels:
+        app: executor
+        jobType: log-message
+    spec:
+      containers:
+        - name: executor
+          image: job-scheduler/executor:latest
+          env:
+            - name: JOB_TYPE
+              value: log-message
+            - name: KAFKA_BROKERS
+              value: kafka:9092
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: job-scheduler-secrets
+                  key: mongo-uri
+            - name: MONGO_DB
+              value: job_scheduler
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+# Autoscale on Kafka consumer group lag for this job type's topic, using
+# KEDA's Kafka scaler. This is the piece that makes "scale executors
+# independently per job type" (design doc section 6) an actual reality
+# instead of just a plan — CPU-based HPA can't see queue depth.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: executor-log-message-scaler
+spec:
+  scaleTargetRef:
+    name: executor-log-message
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka:9092
+        consumerGroup: executor-log-message
+        topic: jobs.dispatch.log-message
+        lagThreshold: "50"      # scale up once lag exceeds 50 messages
+        offsetResetPolicy: latest
