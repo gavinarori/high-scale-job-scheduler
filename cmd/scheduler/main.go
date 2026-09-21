@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/arori/job-scheduler/internal/config"
 	"github.com/arori/job-scheduler/internal/dispatch"
@@ -54,7 +55,32 @@ func main() {
 	}
 
 	loop := scheduler.NewLoop(jobsRepo, cfg.SchedulerTick, 20, dispatchFn)
-	loop.Run(ctx)
+
+	etcdEndpoints := strings.Split(requireEnv("ETCD_ENDPOINTS"), ",")
+	elector, err := scheduler.NewLeaderElector(etcdEndpoints, cfg.WorkerID, 10)
+	if err != nil {
+		log.Fatalf("etcd leader elector init failed: %v", err)
+	}
+	defer elector.Close()
+
+	// Multiple scheduler instances can run this binary safely: only the
+	// one holding the etcd election lock actually ticks the dispatch loop.
+	// Standbys sit in Campaign() (inside RunAsLeader) doing nothing until
+	// the current leader's session dies, at which point one of them takes
+	// over — this is what removes the single-scheduler-instance
+	// constraint from Phase 1/2.
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		err := elector.RunAsLeader(ctx, func(leaderCtx context.Context) {
+			loop.Run(leaderCtx)
+		})
+		if err != nil && ctx.Err() == nil {
+			log.Printf("leader election error, retrying: %v", err)
+			time.Sleep(2 * time.Second)
+		}
+	}
 }
 
 func requireEnv(key string) string {

@@ -1,0 +1,57 @@
+# StatefulSet (not Deployment) so each scheduler pod gets a stable, unique
+# name (scheduler-0, scheduler-1, ...) to use as its etcd election node ID.
+# A Deployment's pod names are random and change on every reschedule, which
+# would make election log/debugging ("who is leader right now") much
+# harder to trace — StatefulSet identity costs nothing here since the
+# scheduler is otherwise stateless.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: scheduler
+spec:
+  serviceName: scheduler
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scheduler
+  template:
+    metadata:
+      labels:
+        app: scheduler
+    spec:
+      containers:
+        - name: scheduler
+          image: job-scheduler/scheduler:latest
+          env:
+            - name: SCHEDULER_TICK
+              value: 500ms
+            - name: KAFKA_BROKERS
+              value: kafka:9092
+            - name: ETCD_ENDPOINTS
+              value: etcd:2379
+            # WORKER_ID intentionally left unset here — falls back to
+            # the pod's stable hostname via the downward API instead of
+            # config.go's random suffix, so restarts don't change identity.
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: job-scheduler-secrets
+                  key: mongo-uri
+            - name: MONGO_DB
+              value: job_scheduler
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          # Only one pod is ever actually dispatching (the elected leader),
+          # so no HPA here — 2 replicas is "1 active + 1 hot standby," not
+          # a scaling dimension. If dispatch throughput itself becomes the
+          # bottleneck, that's solved by more Kafka partitions and executor
+          # replicas, not more schedulers.
