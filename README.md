@@ -1,33 +1,34 @@
-# Job Scheduler — Phase 2
+# Job Scheduler — Phase 3
 
-Distributed job scheduler for high-scale systems. **Phase 2**: the
-scheduler now dispatches via Kafka instead of running jobs in-process, and
-execution lives in its own horizontally scalable `executor` binary — one
-consumer group per job type. No etcd leader election yet (Phase 3), so
-only run a single scheduler instance for now. See `job-scheduler-design.md`
-for the full architecture and phase plan.
+Distributed job scheduler for high-scale systems. **Phase 3**: etcd leader
+election removes the single-scheduler-instance constraint — multiple
+scheduler replicas now run safely, with exactly one dispatching at a time
+and automatic failover on crash. See `job-scheduler-design.md` for the
+full architecture and phase plan.
 
 ## What's implemented
 
 - **API service** (`cmd/api`): create, get, list jobs. Enforces idempotency
   keys at the database level (unique index).
-- **Scheduler** (`cmd/scheduler`): polls Mongo on a fixed tick, atomically
-  claims due jobs via `findOneAndUpdate`, and publishes a small dispatch
-  message (job ID + type + priority) to that job type's Kafka topic.
+- **Scheduler** (`cmd/scheduler`): now runs as multiple replicas safely.
+  Each instance campaigns for leadership via etcd (`internal/scheduler/election.go`);
+  only the elected leader actually ticks the dispatch loop and claims/publishes
+  jobs. Standbys sit warm, doing nothing, until the leader's etcd session
+  dies — crash, network partition, or clean shutdown — at which point one
+  of them takes over automatically. No split-brain window: leadership is
+  watched via the standby's own session, so a leader that loses contact
+  with etcd stops dispatching immediately rather than continuing on stale
+  belief.
 - **Executor** (`cmd/executor`): a Kafka consumer group member for one job
-  type (set via `JOB_TYPE` env var). Fetches the full job payload from
-  Mongo by ID, runs it against the handler registry, and commits its Kafka
-  offset only after the job's result is written back to Mongo. Run one
-  deployment per job type — each scales independently on its own topic's
-  consumer lag (see `deployments/k8s/executor-deployment.yaml`, KEDA-driven).
-- **Reaper** (`cmd/reaper`): two sweeps — one for jobs stuck in
-  `claimed`/`running` past an execution timeout (crashed/hung executor),
-  one for jobs stuck in `queued` past a much shorter timeout (scheduler
-  claimed the job but failed to publish to Kafka). Both reset to `pending`.
-- **DLQ**: jobs that exhaust `maxAttempts` get Mongo status `dlq` *and* a
-  message on the `jobs.dlq` Kafka topic for external inspection/alerting.
+  type (set via `JOB_TYPE` env var). Scales independently per job type on
+  consumer lag (KEDA, see `deployments/k8s/executor-deployment.yaml`).
+- **Reaper** (`cmd/reaper`): sweeps stuck `queued` jobs (short timeout —
+  scheduler claimed but failed to publish) and stuck `claimed`/`running`
+  jobs (longer timeout — executor crashed or hung).
+- **DLQ**: exhausted-retry jobs get Mongo status `dlq` plus a message on
+  the `jobs.dlq` Kafka topic.
 - **Handler registry** (`internal/executor`): register a `func(ctx, payload)
-  error` per `jobType`. Two examples in `internal/executor/handlers/`.
+  error` per `jobType`.
 
 ## Run locally
 
@@ -35,9 +36,15 @@ for the full architecture and phase plan.
 docker compose -f deployments/docker/docker-compose.yml up --build
 ```
 
-This starts Kafka (KRaft mode, no Zookeeper), a single-node Mongo replica
-set (required even solo, since transactions in later phases need it), the
-API, scheduler, one executor per registered job type, and the reaper.
+Starts etcd, Kafka, a single-node Mongo replica set, the API, **two**
+scheduler instances (`scheduler-a`, `scheduler-b` — watch the logs to see
+one become leader and the other sit in `campaigning...`), one executor per
+registered job type, and the reaper.
+
+To see failover in action: find which scheduler logged `elected leader`,
+then `docker compose kill scheduler-a` (or whichever won) and watch the
+other pick up leadership within a few seconds — the `leaseTTL` passed to
+`NewLeaderElector` (10s) bounds the worst-case failover time.
 
 ## Try it
 
@@ -73,11 +80,13 @@ curl "http://localhost:8080/jobs?tenantId=tenant-a"
    ```
 2. Register it in `RegisterAll`: `r.Register("my-job-type", myJobHandler)`.
 
-## What's next (Phase 3+)
+## What's next (Phase 4+)
 
-See `job-scheduler-design.md` section 7. Next up: etcd leader election so
-multiple scheduler instances can run safely (only one dispatches at a
-time), which removes the current single-scheduler-instance constraint.
+See `job-scheduler-design.md` section 7. Retry/backoff and DLQ are already
+implemented (Phase 2's `MarkFailed` + DLQ topic) and covered by the
+integration tests — remaining phases are observability (Prometheus/Grafana
+dashboards for scheduler tick latency, dispatch lag, executor success rate)
+and sharding/multi-tenant isolation if volume demands it.
 
 ## Testing
 

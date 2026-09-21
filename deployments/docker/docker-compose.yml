@@ -4,6 +4,14 @@ version: "3.8"
 # transactions (used later for job + execution_history writes) require
 # a replica set even with one member.
 services:
+  etcd:
+    image: bitnami/etcd:3.5
+    ports:
+      - "2379:2379"
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+
   kafka:
     image: bitnami/kafka:3.7
     ports:
@@ -43,7 +51,7 @@ services:
     depends_on:
       - mongo
 
-  scheduler:
+  scheduler-a:
     build:
       context: ../..
       dockerfile: deployments/docker/Dockerfile.scheduler
@@ -52,9 +60,28 @@ services:
       MONGO_DB: job_scheduler
       SCHEDULER_TICK: 500ms
       KAFKA_BROKERS: kafka:9092
+      ETCD_ENDPOINTS: etcd:2379
+      WORKER_ID: scheduler-a
     depends_on:
       - mongo
       - kafka
+      - etcd
+
+  scheduler-b:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.scheduler
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      SCHEDULER_TICK: 500ms
+      KAFKA_BROKERS: kafka:9092
+      ETCD_ENDPOINTS: etcd:2379
+      WORKER_ID: scheduler-b
+    depends_on:
+      - mongo
+      - kafka
+      - etcd
 
   executor-log-message:
     build:
