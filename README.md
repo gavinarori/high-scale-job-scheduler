@@ -81,7 +81,27 @@ time), which removes the current single-scheduler-instance constraint.
 
 ## Testing
 
-`test/integration/` is scaffolded for spinning up Mongo via testcontainers
-and exercising the claim/retry/reaper logic against a real database rather
-than mocks — concurrency bugs in `ClaimDueJobs` won't show up against a
-mock.
+`test/integration/` runs the claim/retry/reaper logic against a **real**
+Mongo replica set spun up automatically via `testcontainers-go` — not
+mocks. This matters specifically for `ClaimDueJobs`: a mock can't
+meaningfully prove `findOneAndUpdate`'s atomicity guarantee, so
+`claim_test.go` fires 10 concurrent goroutines at a 50-job pool and asserts
+every job was claimed exactly once.
+
+Requires Docker (testcontainers manages the Mongo container lifecycle
+itself — nothing to start manually):
+
+```bash
+go test ./test/integration/... -v
+```
+
+Covered:
+- **Idempotency**: duplicate keys rejected, not silently double-created.
+- **Claiming**: no double-claim under concurrency, future jobs ignored,
+  priority ordering respected.
+- **Retry/DLQ**: attempts increment with backoff until `maxAttempts`, then
+  routes to `dlq` status; DLQ'd jobs are never reclaimed by the scheduler.
+- **Reaper**: stuck `running`/`claimed` jobs past timeout are recovered —
+  and, just as importantly, jobs claimed *moments* ago are left alone (the
+  negative case that actually matters — a reaper that's too eager will
+  duplicate work on slow-but-healthy executors).
