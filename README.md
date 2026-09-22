@@ -1,34 +1,58 @@
-# Job Scheduler — Phase 3
+# Job Scheduler — Phase 4
 
-Distributed job scheduler for high-scale systems. **Phase 3**: etcd leader
-election removes the single-scheduler-instance constraint — multiple
-scheduler replicas now run safely, with exactly one dispatching at a time
-and automatic failover on crash. See `job-scheduler-design.md` for the
-full architecture and phase plan.
+Distributed job scheduler for high-scale systems. **Phase 4**: recurring
+(cron) jobs are now actually implemented — Phase 1-3's `cron` field existed
+on the model but nothing computed occurrences or fired them. See
+`job-scheduler-design.md` for the full architecture and phase plan.
 
 ## What's implemented
 
-- **API service** (`cmd/api`): create, get, list jobs. Enforces idempotency
-  keys at the database level (unique index).
-- **Scheduler** (`cmd/scheduler`): now runs as multiple replicas safely.
-  Each instance campaigns for leadership via etcd (`internal/scheduler/election.go`);
-  only the elected leader actually ticks the dispatch loop and claims/publishes
-  jobs. Standbys sit warm, doing nothing, until the leader's etcd session
-  dies — crash, network partition, or clean shutdown — at which point one
-  of them takes over automatically. No split-brain window: leadership is
-  watched via the standby's own session, so a leader that loses contact
-  with etcd stops dispatching immediately rather than continuing on stale
-  belief.
-- **Executor** (`cmd/executor`): a Kafka consumer group member for one job
-  type (set via `JOB_TYPE` env var). Scales independently per job type on
-  consumer lag (KEDA, see `deployments/k8s/executor-deployment.yaml`).
-- **Reaper** (`cmd/reaper`): sweeps stuck `queued` jobs (short timeout —
-  scheduler claimed but failed to publish) and stuck `claimed`/`running`
-  jobs (longer timeout — executor crashed or hung).
-- **DLQ**: exhausted-retry jobs get Mongo status `dlq` plus a message on
-  the `jobs.dlq` Kafka topic.
+- **API service** (`cmd/api`): create, get, list jobs. Cron jobs compute
+  and validate their first occurrence at creation time — a bad cron
+  expression is rejected immediately with a 400, not discovered later by
+  the scheduler.
+- **Scheduler** (`cmd/scheduler`): multi-instance safe via etcd leader
+  election. For one-off jobs, claims and dispatches as before. For
+  recurring jobs, a claimed template spawns a concrete run-instance
+  (separate document, own idempotency key, no `cron` field — it's a normal
+  job from there on) and reschedules the template to its next occurrence.
+  The template itself is never dispatched or executed — only its spawned
+  instances are, keeping retry/DLQ history scoped per-run rather than
+  polluting the recurring definition's own status.
+- **Executor** (`cmd/executor`): Kafka consumer group per job type, scales
+  on consumer lag.
+- **Reaper** (`cmd/reaper`): sweeps stuck `queued` and `claimed`/`running`
+  jobs — also covers a cron template that got claimed but never
+  successfully rescheduled (e.g. a Mongo write failure mid-reschedule).
+- **DLQ**: exhausted-retry job instances get Mongo status `dlq` + a Kafka
+  message. A cron template with an unparseable expression is also
+  dead-lettered on discovery, so a broken recurring job fails loudly
+  instead of silently stalling forever.
 - **Handler registry** (`internal/executor`): register a `func(ctx, payload)
   error` per `jobType`.
+
+## Recurring jobs
+
+Create one by passing `cron` instead of `scheduledAt`:
+
+```bash
+curl -X POST http://localhost:8080/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "idempotencyKey": "nightly-report",
+    "tenantId": "tenant-a",
+    "jobType": "log-message",
+    "payload": {"message": "nightly report run"},
+    "cron": "0 2 * * *",
+    "maxAttempts": 3
+  }'
+```
+
+Standard 5-field cron (minute hour dom month dow), no seconds field — for
+sub-minute recurrence, use repeated one-off jobs instead. Each firing
+creates a new job document with idempotency key
+`<template-key>-run-<timestamp>`; query `?tenantId=tenant-a` to see the
+run history accumulate alongside the (perpetually `pending`) template.
 
 ## Run locally
 
@@ -36,15 +60,9 @@ full architecture and phase plan.
 docker compose -f deployments/docker/docker-compose.yml up --build
 ```
 
-Starts etcd, Kafka, a single-node Mongo replica set, the API, **two**
-scheduler instances (`scheduler-a`, `scheduler-b` — watch the logs to see
-one become leader and the other sit in `campaigning...`), one executor per
-registered job type, and the reaper.
-
-To see failover in action: find which scheduler logged `elected leader`,
-then `docker compose kill scheduler-a` (or whichever won) and watch the
-other pick up leadership within a few seconds — the `leaseTTL` passed to
-`NewLeaderElector` (10s) bounds the worst-case failover time.
+Starts etcd, Kafka, a single-node Mongo replica set, the API, two scheduler
+instances (leader election — kill the leader to watch failover), one
+executor per registered job type, and the reaper.
 
 ## Try it
 
@@ -80,25 +98,12 @@ curl "http://localhost:8080/jobs?tenantId=tenant-a"
    ```
 2. Register it in `RegisterAll`: `r.Register("my-job-type", myJobHandler)`.
 
-## What's next (Phase 4+)
-
-See `job-scheduler-design.md` section 7. Retry/backoff and DLQ are already
-implemented (Phase 2's `MarkFailed` + DLQ topic) and covered by the
-integration tests — remaining phases are observability (Prometheus/Grafana
-dashboards for scheduler tick latency, dispatch lag, executor success rate)
-and sharding/multi-tenant isolation if volume demands it.
-
 ## Testing
 
-`test/integration/` runs the claim/retry/reaper logic against a **real**
-Mongo replica set spun up automatically via `testcontainers-go` — not
-mocks. This matters specifically for `ClaimDueJobs`: a mock can't
-meaningfully prove `findOneAndUpdate`'s atomicity guarantee, so
-`claim_test.go` fires 10 concurrent goroutines at a 50-job pool and asserts
-every job was claimed exactly once.
-
-Requires Docker (testcontainers manages the Mongo container lifecycle
-itself — nothing to start manually):
+`test/integration/` runs against a **real** Mongo replica set spun up
+automatically via `testcontainers-go` — not mocks. Requires Docker
+(testcontainers manages the container lifecycle; nothing to start
+manually):
 
 ```bash
 go test ./test/integration/... -v
@@ -106,11 +111,24 @@ go test ./test/integration/... -v
 
 Covered:
 - **Idempotency**: duplicate keys rejected, not silently double-created.
-- **Claiming**: no double-claim under concurrency, future jobs ignored,
-  priority ordering respected.
+- **Claiming**: no double-claim under concurrency (10 goroutines racing a
+  50-job pool), future jobs ignored, priority ordering respected.
 - **Retry/DLQ**: attempts increment with backoff until `maxAttempts`, then
-  routes to `dlq` status; DLQ'd jobs are never reclaimed by the scheduler.
-- **Reaper**: stuck `running`/`claimed` jobs past timeout are recovered —
-  and, just as importantly, jobs claimed *moments* ago are left alone (the
-  negative case that actually matters — a reaper that's too eager will
-  duplicate work on slow-but-healthy executors).
+  routes to `dlq`; DLQ'd jobs are never reclaimed.
+- **Reaper**: stuck `running`/`claimed`/`queued` jobs past timeout are
+  recovered — and, just as importantly, jobs claimed *moments* ago are
+  left alone.
+- **Cron**: next-occurrence parsing (valid and invalid expressions),
+  spawned instances carry no `cron` field and get their own idempotency
+  key, template rescheduling moves it to `pending` at the right time, and
+  a queued template can't be double-claimed within one tick (which is what
+  prevents a sub-minute tick interval from firing the same minute twice).
+
+## What's next (Phase 5+)
+
+See `job-scheduler-design.md` section 7. Remaining: Prometheus/Grafana
+observability (scheduler tick latency, dispatch lag, executor success
+rate, consumer lag — the last of which the k8s executor autoscaler already
+assumes exists but nothing exports yet), an etcd failover test with the
+same rigor as the claim-concurrency test, a load test for actual dispatch
+throughput, and sharding/multi-tenant isolation once volume demands it.
