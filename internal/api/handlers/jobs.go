@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/arori/job-scheduler/internal/models"
+	"github.com/arori/job-scheduler/internal/scheduler"
 	"github.com/arori/job-scheduler/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
@@ -28,6 +30,22 @@ func (h *JobsHandler) CreateJob(w http.ResponseWriter, r *http.Request) {
 
 	if req.IdempotencyKey == "" || req.JobType == "" || req.TenantID == "" {
 		writeError(w, http.StatusBadRequest, "idempotencyKey, jobType, and tenantId are required")
+		return
+	}
+
+	// Recurring jobs compute their own first occurrence from the cron
+	// expression rather than taking a client-supplied scheduledAt — this
+	// also validates the expression at creation time instead of letting a
+	// typo silently sit until the scheduler discovers it can't parse it.
+	if req.Cron != "" {
+		next, err := scheduler.NextOccurrence(req.Cron, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.ScheduledAt = next
+	} else if req.ScheduledAt.IsZero() {
+		writeError(w, http.StatusBadRequest, "scheduledAt is required for non-recurring jobs")
 		return
 	}
 

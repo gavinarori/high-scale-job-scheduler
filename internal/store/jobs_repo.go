@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/arori/job-scheduler/internal/models"
@@ -192,6 +193,69 @@ func (r *JobsRepo) SweepStuckJobs(ctx context.Context, timeout time.Duration) (i
 // much faster than an execution hang, hence the separate, shorter timeout.
 func (r *JobsRepo) SweepStuckQueuedJobs(ctx context.Context, timeout time.Duration) (int64, error) {
 	return r.sweepByStatus(ctx, timeout, models.StatusQueued)
+}
+
+// SpawnCronInstance creates a concrete, one-off run of a recurring job
+// template. The instance carries no cron field — it's a normal job from
+// here on, going through the same dispatch/execute/retry path as anything
+// created via the API. Created directly in "queued" status since it's
+// meant to fire immediately (the scheduler loop calls this only once the
+// template's own scheduledAt is already due).
+func (r *JobsRepo) SpawnCronInstance(ctx context.Context, template models.Job) (*models.Job, error) {
+	now := time.Now().UTC()
+	instance := models.Job{
+		IdempotencyKey: fmt.Sprintf("%s-run-%d", template.IdempotencyKey, now.UnixNano()),
+		TenantID:       template.TenantID,
+		JobType:        template.JobType,
+		Payload:        template.Payload,
+		Priority:       template.Priority,
+		Status:         models.StatusQueued,
+		ScheduledAt:    now,
+		Attempts:       0,
+		MaxAttempts:    template.MaxAttempts,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	res, err := r.coll.InsertOne(ctx, instance)
+	if err != nil {
+		return nil, fmt.Errorf("spawn cron instance: %w", err)
+	}
+	instance.ID = res.InsertedID.(primitive.ObjectID)
+	return &instance, nil
+}
+
+// RescheduleCronTemplate moves a recurring job's template back to "pending"
+// at its next occurrence. Called right after SpawnCronInstance so the
+// template becomes eligible for claiming again at the right future time —
+// the template itself is never dispatched or executed, only its spawned
+// instances are.
+func (r *JobsRepo) RescheduleCronTemplate(ctx context.Context, id primitive.ObjectID, next time.Time) error {
+	_, err := r.coll.UpdateOne(ctx,
+		bson.M{"_id": id},
+		bson.M{"$set": bson.M{
+			"status":      models.StatusPending,
+			"scheduledAt": next,
+			"updatedAt":   time.Now().UTC(),
+		}},
+	)
+	return err
+}
+
+// MarkCronInvalid dead-letters a recurring template whose cron expression
+// can no longer be parsed (e.g. hand-edited directly in Mongo). Without
+// this, a bad expression would leave the template permanently stuck in
+// "queued" — claimed but never rescheduled — silently halting that
+// recurring job forever with no visible error.
+func (r *JobsRepo) MarkCronInvalid(ctx context.Context, id primitive.ObjectID, reason string) error {
+	_, err := r.coll.UpdateOne(ctx,
+		bson.M{"_id": id},
+		bson.M{"$set": bson.M{
+			"status":    models.StatusDLQ,
+			"lastError": reason,
+			"updatedAt": time.Now().UTC(),
+		}},
+	)
+	return err
 }
 
 func (r *JobsRepo) sweepByStatus(ctx context.Context, timeout time.Duration, statuses ...models.JobStatus) (int64, error) {
