@@ -12,6 +12,7 @@ import (
 	"github.com/arori/job-scheduler/internal/config"
 	"github.com/arori/job-scheduler/internal/dispatch"
 	"github.com/arori/job-scheduler/internal/models"
+	"github.com/arori/job-scheduler/internal/observability"
 	"github.com/arori/job-scheduler/internal/scheduler"
 	"github.com/arori/job-scheduler/internal/store"
 )
@@ -20,6 +21,9 @@ func main() {
 	cfg := config.Load()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	metrics := observability.NewMetrics()
+	go observability.ServeMetrics(":" + getEnv("METRICS_PORT", "9100"))
 
 	client, err := store.Connect(ctx, cfg.MongoURI)
 	if err != nil {
@@ -47,6 +51,7 @@ func main() {
 			Priority: job.Priority,
 		}
 		if err := producer.PublishDispatch(ctx, msg); err != nil {
+			metrics.DispatchErrorsTotal.Inc()
 			log.Printf("job %s: failed to publish dispatch message: %v", job.ID.Hex(), err)
 			// Note: the job stays "queued" in Mongo on publish failure.
 			// The reaper's stuck-job sweep (status=queued past timeout)
@@ -54,7 +59,7 @@ func main() {
 		}
 	}
 
-	loop := scheduler.NewLoop(jobsRepo, cfg.SchedulerTick, 20, dispatchFn)
+	loop := scheduler.NewLoop(jobsRepo, cfg.SchedulerTick, 20, dispatchFn, metrics)
 
 	etcdEndpoints := strings.Split(requireEnv("ETCD_ENDPOINTS"), ",")
 	elector, err := scheduler.NewLeaderElector(etcdEndpoints, cfg.WorkerID, 10)
@@ -89,4 +94,11 @@ func requireEnv(key string) string {
 		log.Fatalf("required env var %s is not set", key)
 	}
 	return v
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

@@ -4,16 +4,23 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/arori/job-scheduler/internal/api/handlers"
 	"github.com/arori/job-scheduler/internal/config"
+	"github.com/arori/job-scheduler/internal/observability"
 	"github.com/arori/job-scheduler/internal/store"
 )
 
 func main() {
 	cfg := config.Load()
 	ctx := context.Background()
+
+	// Metrics on their own port/listener — job traffic and Prometheus
+	// scrape traffic shouldn't share a mux, so an unusual scrape pattern
+	// or an outage in one can't affect the other.
+	go observability.ServeMetrics(":" + getEnv("METRICS_PORT", "9100"))
 
 	client, err := store.Connect(ctx, cfg.MongoURI)
 	if err != nil {
@@ -57,4 +64,11 @@ func main() {
 	addr := ":" + cfg.HTTPPort
 	log.Printf("api service listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

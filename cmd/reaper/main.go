@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/arori/job-scheduler/internal/config"
+	"github.com/arori/job-scheduler/internal/observability"
 	"github.com/arori/job-scheduler/internal/store"
 )
 
@@ -18,6 +19,9 @@ func main() {
 	cfg := config.Load()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	metrics := observability.NewMetrics()
+	go observability.ServeMetrics(":" + getEnv("METRICS_PORT", "9100"))
 
 	client, err := store.Connect(ctx, cfg.MongoURI)
 	if err != nil {
@@ -42,6 +46,7 @@ func main() {
 			if err != nil {
 				log.Printf("execution sweep failed: %v", err)
 			} else if n > 0 {
+				metrics.ReaperRecoveredTotal.WithLabelValues("execution").Add(float64(n))
 				log.Printf("reaper recovered %d stuck claimed/running job(s)", n)
 			}
 
@@ -49,8 +54,16 @@ func main() {
 			if err != nil {
 				log.Printf("queued sweep failed: %v", err)
 			} else if qn > 0 {
+				metrics.ReaperRecoveredTotal.WithLabelValues("queued").Add(float64(qn))
 				log.Printf("reaper recovered %d stuck queued job(s)", qn)
 			}
 		}
 	}
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
