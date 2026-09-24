@@ -136,10 +136,22 @@ Covered:
   a queued template can't be double-claimed within one tick (which is what
   prevents a sub-minute tick interval from firing the same minute twice).
 
-## What's next (Phase 6+)
+## Load testing
+
+`test/load/` benchmarks claim throughput (with a correctness assertion,
+not just a number) and API job-creation throughput at increasing
+concurrency. See `test/load/README.md` for how to run and interpret them.
+
+```bash
+go test ./test/load/... -bench . -benchtime=1x -run ^$ -v
+```
+
+## What's next (Phase 7+)
 
 See `job-scheduler-design.md` section 7. Remaining: pre-built Grafana
 dashboards (currently just the raw Prometheus data source — no dashboard
 JSON committed yet), an etcd failover test with the same rigor as the
-claim-concurrency test, a load test for actual dispatch throughput, and
+claim-concurrency benchmark, an end-to-end dispatch-throughput load test
+(scheduler → Kafka → executor, needs a running broker rather than just
+Mongo — see the load test README's "what these don't cover" section), and
 sharding/multi-tenant isolation once volume demands it.
