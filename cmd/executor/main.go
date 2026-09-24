@@ -12,6 +12,7 @@ import (
 	"github.com/arori/job-scheduler/internal/dispatch"
 	"github.com/arori/job-scheduler/internal/executor"
 	exhandlers "github.com/arori/job-scheduler/internal/executor/handlers"
+	"github.com/arori/job-scheduler/internal/observability"
 	"github.com/arori/job-scheduler/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
@@ -27,6 +28,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	metrics := observability.NewMetrics()
+	go observability.ServeMetrics(":" + getEnv("METRICS_PORT", "9100"))
 
 	client, err := store.Connect(ctx, cfg.MongoURI)
 	if err != nil {
@@ -45,7 +49,7 @@ func main() {
 	}
 	defer producer.Close()
 
-	runner := executor.NewRunner(jobsRepo, registry, cfg.WorkerID)
+	runner := executor.NewRunner(jobsRepo, registry, cfg.WorkerID, metrics)
 	runner.Producer = producer
 
 	handler := func(ctx context.Context, msg dispatch.DispatchMessage) error {
@@ -79,4 +83,11 @@ func requireEnv(key string) string {
 		log.Fatalf("required env var %s is not set", key)
 	}
 	return v
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

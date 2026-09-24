@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:9100"]
+
+  - job_name: scheduler
+    static_configs:
+      - targets: ["scheduler-a:9100", "scheduler-b:9100"]
+        labels:
+          component: scheduler
+
+  - job_name: executor
+    static_configs:
+      - targets: ["executor-log-message:9100"]
+        labels:
+          job_type: log-message
+      - targets: ["executor-noop:9100"]
+        labels:
+          job_type: noop
+
+  - job_name: reaper
+    static_configs:
+      - targets: ["reaper:9100"]

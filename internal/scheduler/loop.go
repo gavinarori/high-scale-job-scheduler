@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/arori/job-scheduler/internal/models"
+	"github.com/arori/job-scheduler/internal/observability"
 	"github.com/arori/job-scheduler/internal/store"
 )
 
@@ -24,10 +25,11 @@ type Loop struct {
 	tick      time.Duration
 	batchSize int
 	dispatch  DispatchFunc
+	metrics   *observability.Metrics
 }
 
-func NewLoop(repo *store.JobsRepo, tick time.Duration, batchSize int, dispatch DispatchFunc) *Loop {
-	return &Loop{repo: repo, tick: tick, batchSize: batchSize, dispatch: dispatch}
+func NewLoop(repo *store.JobsRepo, tick time.Duration, batchSize int, dispatch DispatchFunc, metrics *observability.Metrics) *Loop {
+	return &Loop{repo: repo, tick: tick, batchSize: batchSize, dispatch: dispatch, metrics: metrics}
 }
 
 // Run blocks, ticking until ctx is cancelled.
@@ -49,10 +51,18 @@ func (l *Loop) Run(ctx context.Context) {
 }
 
 func (l *Loop) runOnce(ctx context.Context) {
+	start := time.Now()
+	defer func() {
+		l.metrics.SchedulerTickDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	jobs, err := l.repo.ClaimDueJobs(ctx, time.Now().UTC(), l.batchSize)
 	if err != nil {
 		log.Printf("claim due jobs failed: %v", err)
 		return
+	}
+	if len(jobs) > 0 {
+		l.metrics.JobsClaimedTotal.Add(float64(len(jobs)))
 	}
 
 	dispatched := 0
@@ -81,10 +91,12 @@ func (l *Loop) handleCronJob(ctx context.Context, template models.Job) {
 		log.Printf("cron template %s: failed to spawn instance: %v", template.ID.Hex(), err)
 		return
 	}
+	l.metrics.CronInstancesSpawned.Inc()
 
 	next, err := NextOccurrence(template.Cron, time.Now().UTC())
 	if err != nil {
 		log.Printf("cron template %s: invalid cron expression, dead-lettering: %v", template.ID.Hex(), err)
+		l.metrics.CronInvalidTotal.Inc()
 		if err := l.repo.MarkCronInvalid(ctx, template.ID, err.Error()); err != nil {
 			log.Printf("cron template %s: failed to mark invalid: %v", template.ID.Hex(), err)
 		}

@@ -2,13 +2,13 @@ package executor
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math"
 	"time"
 
 	"github.com/arori/job-scheduler/internal/dispatch"
 	"github.com/arori/job-scheduler/internal/models"
+	"github.com/arori/job-scheduler/internal/observability"
 	"github.com/arori/job-scheduler/internal/store"
 )
 
@@ -24,21 +24,24 @@ type Runner struct {
 	// on the DLQ Kafka topic for external inspection, in addition to the
 	// "dlq" status Mongo already records.
 	Producer *dispatch.Producer
+	Metrics  *observability.Metrics
 }
 
-func NewRunner(repo *store.JobsRepo, registry *Registry, workerID string) *Runner {
+func NewRunner(repo *store.JobsRepo, registry *Registry, workerID string, metrics *observability.Metrics) *Runner {
 	return &Runner{
 		Repo:     repo,
 		Registry: registry,
 		WorkerID: workerID,
 		Timeout:  defaultExecutionTimeout,
+		Metrics:  metrics,
 	}
 }
 
 // Execute runs a single job end to end: claim -> run -> mark result.
-// Called directly by the Phase 1 scheduler dispatch func; in Phase 2 this
-// is called from the Kafka consumer's message handler instead.
+// Called from the Kafka consumer's message handler (cmd/executor).
 func (rn *Runner) Execute(ctx context.Context, job models.Job) {
+	start := time.Now()
+
 	if err := rn.Repo.MarkClaimed(ctx, job.ID, rn.WorkerID); err != nil {
 		log.Printf("job %s: failed to mark claimed: %v", job.ID.Hex(), err)
 		return
@@ -62,6 +65,9 @@ func (rn *Runner) Execute(ctx context.Context, job models.Job) {
 		return
 	}
 
+	rn.Metrics.JobDuration.WithLabelValues(job.JobType).Observe(time.Since(start).Seconds())
+	rn.Metrics.JobsProcessedTotal.WithLabelValues(job.JobType, "success").Inc()
+
 	if err := rn.Repo.MarkCompleted(ctx, job.ID); err != nil {
 		log.Printf("job %s: failed to mark completed: %v", job.ID.Hex(), err)
 		return
@@ -72,6 +78,8 @@ func (rn *Runner) Execute(ctx context.Context, job models.Job) {
 func (rn *Runner) fail(ctx context.Context, job models.Job, cause error) {
 	backoff := exponentialBackoff(job.Attempts)
 	exhausted := job.Attempts+1 >= job.MaxAttempts
+
+	rn.Metrics.JobsProcessedTotal.WithLabelValues(job.JobType, "failure").Inc()
 
 	if err := rn.Repo.MarkFailed(ctx, job.ID, cause.Error(), backoff); err != nil {
 		log.Printf("job %s: failed to mark failed: %v", job.ID.Hex(), err)
@@ -92,7 +100,3 @@ func exponentialBackoff(attempt int) time.Duration {
 	seconds := math.Min(math.Pow(2, float64(attempt)), 300)
 	return time.Duration(seconds) * time.Second
 }
-
-// Example handler signature for reference — real implementations live in
-// internal/executor/handlers/.
-var _ = fmt.Sprintf

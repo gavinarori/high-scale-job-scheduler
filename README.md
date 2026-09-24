@@ -1,35 +1,58 @@
-# Job Scheduler — Phase 4
+# Job Scheduler — Phase 5
 
-Distributed job scheduler for high-scale systems. **Phase 4**: recurring
-(cron) jobs are now actually implemented — Phase 1-3's `cron` field existed
-on the model but nothing computed occurrences or fired them. See
-`job-scheduler-design.md` for the full architecture and phase plan.
+Distributed job scheduler for high-scale systems. **Phase 5**: Prometheus
+metrics across all four binaries, plus a local Prometheus + Grafana stack
+for actually looking at them. See `job-scheduler-design.md` for the full
+architecture and phase plan.
 
 ## What's implemented
 
 - **API service** (`cmd/api`): create, get, list jobs. Cron jobs compute
-  and validate their first occurrence at creation time — a bad cron
-  expression is rejected immediately with a 400, not discovered later by
-  the scheduler.
+  and validate their first occurrence at creation time.
 - **Scheduler** (`cmd/scheduler`): multi-instance safe via etcd leader
-  election. For one-off jobs, claims and dispatches as before. For
-  recurring jobs, a claimed template spawns a concrete run-instance
-  (separate document, own idempotency key, no `cron` field — it's a normal
-  job from there on) and reschedules the template to its next occurrence.
-  The template itself is never dispatched or executed — only its spawned
-  instances are, keeping retry/DLQ history scoped per-run rather than
-  polluting the recurring definition's own status.
+  election. Handles one-off and recurring (cron) jobs — see the Phase 4
+  README history in git for details on the template/instance split.
 - **Executor** (`cmd/executor`): Kafka consumer group per job type, scales
   on consumer lag.
 - **Reaper** (`cmd/reaper`): sweeps stuck `queued` and `claimed`/`running`
-  jobs — also covers a cron template that got claimed but never
-  successfully rescheduled (e.g. a Mongo write failure mid-reschedule).
-- **DLQ**: exhausted-retry job instances get Mongo status `dlq` + a Kafka
-  message. A cron template with an unparseable expression is also
-  dead-lettered on discovery, so a broken recurring job fails loudly
-  instead of silently stalling forever.
-- **Handler registry** (`internal/executor`): register a `func(ctx, payload)
-  error` per `jobType`.
+  jobs.
+- **DLQ**: exhausted-retry instances and unparseable cron templates both
+  dead-letter, with a Kafka message for the former.
+- **Observability** (`internal/observability`): every binary exposes
+  `/metrics` (Prometheus format) and `/healthz` on port 9100 (override with
+  `METRICS_PORT`), served on a listener separate from job/API traffic so
+  scrape load and outages can't cross-affect each other.
+
+## Metrics exposed
+
+| Metric | Type | Labels | What it tells you |
+|---|---|---|---|
+| `scheduler_tick_duration_seconds` | histogram | — | Is the claim+dispatch loop keeping up with the tick interval |
+| `scheduler_jobs_claimed_total` | counter | — | Throughput of jobs entering dispatch |
+| `scheduler_dispatch_errors_total` | counter | — | Kafka publish failures (each one relies on the reaper's queued-sweep to recover) |
+| `scheduler_cron_instances_spawned_total` | counter | — | Recurring job firing rate |
+| `scheduler_cron_invalid_total` | counter | — | Recurring templates that broke and got dead-lettered |
+| `executor_jobs_processed_total` | counter | `job_type`, `result` | Success/failure rate per job type |
+| `executor_job_duration_seconds` | histogram | `job_type` | Handler execution time per job type — the input KEDA's lag-based scaling should eventually be tuned against |
+| `reaper_recovered_jobs_total` | counter | `sweep` (`queued`\|`execution`) | How often jobs are getting stuck — a rising rate here means something upstream (Kafka, an executor) is unhealthy |
+
+Note: Kafka **consumer lag** (what the k8s `ScaledObject` in
+`executor-deployment.yaml` actually scales on) comes from KEDA's own Kafka
+scaler querying the broker directly — it's not one of the metrics above,
+since the executor process itself doesn't need to export lag it can't see
+outside its own consumer group's viewpoint.
+
+## Run locally
+
+```bash
+docker compose -f deployments/docker/docker-compose.yml up --build
+```
+
+Starts etcd, Kafka, Mongo, the API, two scheduler instances, one executor
+per job type, the reaper, **Prometheus** (`localhost:9090`), and
+**Grafana** (`localhost:3000`, anonymous admin access for local dev). Add
+Prometheus as a Grafana data source (`http://prometheus:9090`) to start
+building dashboards — none are pre-built yet, see "What's next."
 
 ## Recurring jobs
 
@@ -48,21 +71,10 @@ curl -X POST http://localhost:8080/jobs \
   }'
 ```
 
-Standard 5-field cron (minute hour dom month dow), no seconds field — for
-sub-minute recurrence, use repeated one-off jobs instead. Each firing
-creates a new job document with idempotency key
-`<template-key>-run-<timestamp>`; query `?tenantId=tenant-a` to see the
-run history accumulate alongside the (perpetually `pending`) template.
-
-## Run locally
-
-```bash
-docker compose -f deployments/docker/docker-compose.yml up --build
-```
-
-Starts etcd, Kafka, a single-node Mongo replica set, the API, two scheduler
-instances (leader election — kill the leader to watch failover), one
-executor per registered job type, and the reaper.
+Standard 5-field cron (minute hour dom month dow), no seconds field. Each
+firing creates a new job document with idempotency key
+`<template-key>-run-<timestamp>`; the template itself never dispatches —
+only its spawned instances do.
 
 ## Try it
 
@@ -124,11 +136,10 @@ Covered:
   a queued template can't be double-claimed within one tick (which is what
   prevents a sub-minute tick interval from firing the same minute twice).
 
-## What's next (Phase 5+)
+## What's next (Phase 6+)
 
-See `job-scheduler-design.md` section 7. Remaining: Prometheus/Grafana
-observability (scheduler tick latency, dispatch lag, executor success
-rate, consumer lag — the last of which the k8s executor autoscaler already
-assumes exists but nothing exports yet), an etcd failover test with the
-same rigor as the claim-concurrency test, a load test for actual dispatch
-throughput, and sharding/multi-tenant isolation once volume demands it.
+See `job-scheduler-design.md` section 7. Remaining: pre-built Grafana
+dashboards (currently just the raw Prometheus data source — no dashboard
+JSON committed yet), an etcd failover test with the same rigor as the
+claim-concurrency test, a load test for actual dispatch throughput, and
+sharding/multi-tenant isolation once volume demands it.
