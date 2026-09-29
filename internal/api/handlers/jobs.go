@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/arori/job-scheduler/internal/models"
@@ -83,7 +84,10 @@ func (h *JobsHandler) GetJob(w http.ResponseWriter, r *http.Request, idParam str
 	writeJSON(w, http.StatusOK, job)
 }
 
-// ListJobs handles GET /jobs?tenantId=...&status=...
+// ListJobs handles GET /jobs?tenantId=...&status=...&limit=...
+// limit defaults to 100 and caps at 5000 — high enough for load-test
+// polling and demo dashboards without letting an unbounded query param
+// force a full collection scan against Mongo.
 func (h *JobsHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenantId")
 	if tenantID == "" {
@@ -92,7 +96,17 @@ func (h *JobsHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	status := models.JobStatus(r.URL.Query().Get("status"))
 
-	jobs, err := h.Repo.ListByTenant(r.Context(), tenantID, status, 100)
+	limit := int64(100)
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			limit = parsed
+			if limit > 5000 {
+				limit = 5000
+			}
+		}
+	}
+
+	jobs, err := h.Repo.ListByTenant(r.Context(), tenantID, status, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list jobs")
 		return

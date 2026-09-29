@@ -20,6 +20,12 @@ scrape_configs:
       - targets: ["executor-noop:9100"]
         labels:
           job_type: noop
+      - targets: ["executor-flaky:9100"]
+        labels:
+          job_type: flaky
+      - targets: ["executor-slow:9100"]
+        labels:
+          job_type: slow
 
   - job_name: reaper
     static_configs:

@@ -1,27 +1,31 @@
-# Job Scheduler — Phase 5
+# Job Scheduler — Phase 8
 
-Distributed job scheduler for high-scale systems. **Phase 5**: Prometheus
-metrics across all four binaries, plus a local Prometheus + Grafana stack
-for actually looking at them. See `job-scheduler-design.md` for the full
-architecture and phase plan.
+Distributed job scheduler for high-scale systems. **Phase 8**: a seed
+script for demo/manual-testing data, and an end-to-end load driver that
+exercises the whole running pipeline over HTTP (distinct from `test/load`'s
+Go benchmarks, which measure individual layers in isolation). See
+`job-scheduler-design.md` for the full architecture and phase plan.
 
 ## What's implemented
 
-- **API service** (`cmd/api`): create, get, list jobs. Cron jobs compute
-  and validate their first occurrence at creation time.
+- **API service** (`cmd/api`): create, get, list (with `limit`) jobs. Cron
+  jobs compute and validate their first occurrence at creation time.
 - **Scheduler** (`cmd/scheduler`): multi-instance safe via etcd leader
-  election. Handles one-off and recurring (cron) jobs — see the Phase 4
-  README history in git for details on the template/instance split.
+  election. Handles one-off and recurring (cron) jobs.
 - **Executor** (`cmd/executor`): Kafka consumer group per job type, scales
-  on consumer lag.
+  on consumer lag. Four handlers registered: `noop`, `log-message`,
+  `flaky` (configurable failure rate — exists specifically so retry/DLQ
+  gets exercised by real runs, not just unit tests), and `slow`
+  (configurable sleep, for load-testing realistic handler latency).
 - **Reaper** (`cmd/reaper`): sweeps stuck `queued` and `claimed`/`running`
   jobs.
 - **DLQ**: exhausted-retry instances and unparseable cron templates both
   dead-letter, with a Kafka message for the former.
 - **Observability** (`internal/observability`): every binary exposes
   `/metrics` (Prometheus format) and `/healthz` on port 9100 (override with
-  `METRICS_PORT`), served on a listener separate from job/API traffic so
-  scrape load and outages can't cross-affect each other.
+  `METRICS_PORT`), served on a listener separate from job/API traffic.
+- **Seed script** (`cmd/seed`) and **load driver** (`cmd/loadtest`) — see
+  their own sections below.
 
 ## Metrics exposed
 
@@ -44,6 +48,11 @@ outside its own consumer group's viewpoint.
 
 ## Run locally
 
+Two ways to run this, depending on whether you want a fully local stack or
+to point at a real MongoDB (e.g. Atlas):
+
+**Option A — everything local (Docker):**
+
 ```bash
 docker compose -f deployments/docker/docker-compose.yml up --build
 ```
@@ -53,6 +62,24 @@ per job type, the reaper, **Prometheus** (`localhost:9090`), and
 **Grafana** (`localhost:3000`, anonymous admin access for local dev). Add
 Prometheus as a Grafana data source (`http://prometheus:9090`) to start
 building dashboards — none are pre-built yet, see "What's next."
+
+**Option B — Mongo hosted (Atlas), everything else local:**
+
+```bash
+cp .env.example .env   # fill in your real MONGO_URI
+go run ./cmd/api
+```
+
+`config.Load()` auto-loads `.env` from the working directory if present
+(via `godotenv`) — real deployments (docker-compose, k8s) set env vars
+directly and never touch `.env` at all. `.env` is gitignored; never commit
+real credentials to `.env.example` or anywhere else in the repo. Note:
+drop any `?replicaSet=...` query param when pointing at Atlas — the
+`mongodb+srv://` scheme already resolves to the cluster's own replica set.
+You'd still need Kafka and etcd running somewhere (locally via
+`docker compose up kafka etcd`, or point `KAFKA_BROKERS`/`ETCD_ENDPOINTS`
+at hosted equivalents) to run `cmd/scheduler` and `cmd/executor` this way —
+`cmd/api` alone only needs Mongo.
 
 ## Recurring jobs
 
@@ -100,6 +127,44 @@ through `logMessageHandler`, and marked `completed`. Check status:
 curl "http://localhost:8080/jobs?tenantId=tenant-a"
 ```
 
+## Seeding demo data
+
+`cmd/seed` populates the database directly (bypassing the API/Kafka — this
+is a setup step, not a load test) with a realistic mix: one-off jobs
+(some immediate, some scheduled minutes/hours out), a configurable
+fraction using the `flaky` handler (so retries and the DLQ actually have
+entries to look at), some `slow` jobs, and a few recurring cron templates
+across multiple tenants.
+
+```bash
+go run ./cmd/seed                                    # defaults: 200 jobs, 3 tenants
+go run ./cmd/seed -count 1000 -tenants 5 -flaky-rate 0.3
+# or, against the docker-compose stack:
+docker compose -f deployments/docker/docker-compose.yml run --rm seed -count 500
+```
+
+Run this right after bringing the stack up and watch Grafana/the executor
+logs — it's the fastest way to see every code path (retry, backoff, DLQ,
+cron firing) exercised without hand-writing curl commands for each one.
+
+## Load testing the running system
+
+`cmd/loadtest` is different from `test/load`'s Go benchmarks — it drives
+load against a **running stack** over HTTP and measures real end-to-end
+latency through the whole pipeline (API → Mongo → scheduler → Kafka →
+executor), not just one layer in isolation:
+
+```bash
+go run ./cmd/loadtest -rate 20 -duration 30s
+go run ./cmd/loadtest -rate 100 -duration 1m -jobtype slow -maxwait 5m
+```
+
+It sends jobs at a target rate for a fixed duration (reporting HTTP ack
+latency), then polls each created job by ID until it reaches `completed`
+or `dlq`, reporting end-to-end latency percentiles (p50/p95/p99) and how
+many jobs didn't finish within `-maxwait`. Needs the full stack running,
+not just Mongo — `docker compose up` first.
+
 ## Adding a new job type
 
 1. Write a handler in `internal/executor/handlers/handlers.go`:
@@ -136,10 +201,21 @@ Covered:
   a queued template can't be double-claimed within one tick (which is what
   prevents a sub-minute tick interval from firing the same minute twice).
 
-## What's next (Phase 6+)
+## Load testing
+
+`test/load/` benchmarks claim throughput (with a correctness assertion,
+not just a number) and API job-creation throughput at increasing
+concurrency. See `test/load/README.md` for how to run and interpret them.
+
+```bash
+go test ./test/load/... -bench . -benchtime=1x -run ^$ -v
+```
+
+## What's next (Phase 9+)
 
 See `job-scheduler-design.md` section 7. Remaining: pre-built Grafana
 dashboards (currently just the raw Prometheus data source — no dashboard
 JSON committed yet), an etcd failover test with the same rigor as the
-claim-concurrency test, a load test for actual dispatch throughput, and
-sharding/multi-tenant isolation once volume demands it.
+claim-concurrency benchmark, and sharding/multi-tenant isolation once
+volume demands it. End-to-end dispatch throughput is now covered by
+`cmd/loadtest`.
