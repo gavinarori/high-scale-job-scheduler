@@ -4,6 +4,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // Config holds all environment-derived settings for every binary in the
@@ -21,6 +23,13 @@ type Config struct {
 }
 
 func Load() Config {
+	// Best-effort: loads a .env file from the working directory if present
+	// (e.g. running `go run ./cmd/api` directly against a hosted Mongo
+	// like Atlas, without a docker-compose environment block). Silently
+	// no-ops if the file doesn't exist — real deployments (docker-compose,
+	// k8s) set env vars directly and never need a .env file at all.
+	_ = godotenv.Load()
+
 	return Config{
 		MongoURI:       getEnv("MONGO_URI", "mongodb://localhost:27017"),
 		MongoDB:        getEnv("MONGO_DB", "job_scheduler"),

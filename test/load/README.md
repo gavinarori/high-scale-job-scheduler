@@ -62,14 +62,14 @@ also surfaces the throughput number in Go's standard benchmark output
 format, so these numbers are diffable across runs/commits if you want to
 track regressions over time (`benchstat` works against saved output).
 
-## What these don't cover yet
+## What these don't cover
 
 - **Dispatch-to-execution throughput** (scheduler → Kafka → executor →
-  Mongo write-back, end to end) isn't benchmarked — that needs a running
-  Kafka broker and executor process, not just Mongo, so it's a heavier
-  lift than a Go benchmark can spin up on its own. A `docker compose`-based
-  load driver (hit the API at N req/sec, watch Grafana) is the more
-  practical way to measure that, now that Phase 5 has metrics wired up.
+  Mongo write-back, end to end) isn't a Go benchmark here — that needs a
+  running Kafka broker and executor process, not just Mongo. Use
+  **`cmd/loadtest`** instead (`go run ./cmd/loadtest -rate 20 -duration 30s`
+  against a running `docker compose` stack) — it drives real HTTP load and
+  reports actual end-to-end completion latency through the whole pipeline.
 - **Sustained load / soak testing** — these benchmarks run once and stop;
   they don't reveal memory growth, connection pool exhaustion, or Mongo
   index degradation under hours of continuous load.

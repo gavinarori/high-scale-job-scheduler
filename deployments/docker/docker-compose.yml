@@ -109,6 +109,32 @@ services:
       - mongo
       - kafka
 
+  executor-flaky:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.executor
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      KAFKA_BROKERS: kafka:9092
+      JOB_TYPE: flaky
+    depends_on:
+      - mongo
+      - kafka
+
+  executor-slow:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.executor
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
+      KAFKA_BROKERS: kafka:9092
+      JOB_TYPE: slow
+    depends_on:
+      - mongo
+      - kafka
+
   reaper:
     build:
       context: ../..
@@ -118,6 +144,17 @@ services:
       MONGO_DB: job_scheduler
       CLAIM_TIMEOUT: 5m
       QUEUED_TIMEOUT: 30s
+    depends_on:
+      - mongo
+
+  seed:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.seed
+    profiles: ["tools"] # excluded from `docker compose up`; run explicitly via `docker compose run seed`
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGO_DB: job_scheduler
     depends_on:
       - mongo
 
@@ -133,6 +170,8 @@ services:
       - scheduler-b
       - executor-log-message
       - executor-noop
+      - executor-flaky
+      - executor-slow
       - reaper
 
   grafana:
